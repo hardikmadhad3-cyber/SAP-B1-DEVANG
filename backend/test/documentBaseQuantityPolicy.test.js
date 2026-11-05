@@ -1,0 +1,15 @@
+const test=require('node:test');const assert=require('node:assert/strict');
+const db=require('../services/dbService');const delivery=require('../services/deliveryDbService');const ar=require('../services/arInvoiceDbService');const ap=require('../services/apInvoiceDbService');
+const {allowsBaseQuantityIncrease}=require('../services/documentBaseQuantityPolicy');
+const source={DocEntry:41,DocNum:100,CardCode:'C001',DocStatus:'O',CANCELED:'N',LineNum:0,LineStatus:'O',ItemCode:'I001',OpenQty:20,Quantity:20};
+const line=(baseType,quantity='20.120')=>({itemNo:'I001',quantity,baseType,baseEntry:41,baseLine:0});
+const mockSource=(t,extra={})=>t.mock.method(db,'query',async()=>({recordset:[{...source,...extra}]}));
+test('20 -> 20.120 can be delivered from the open Sales Order',async t=>{mockSource(t);assert.equal((await delivery.validateDeliveryBaseDocumentLines([line(17)],'C001')).isValid,true);});
+test('overdelivery is a document rule, not an invented small numeric tolerance',async t=>{mockSource(t);assert.equal((await delivery.validateDeliveryBaseDocumentLines([line(17,'25')],'C001')).isValid,true);});
+for(const change of [{DocStatus:'C'},{LineStatus:'C'},{CANCELED:'Y'},{OpenQty:0}])test('a closed, cancelled or exhausted order cannot be copied: '+JSON.stringify(change),async t=>{mockSource(t,change);assert.equal((await delivery.validateDeliveryBaseDocumentLines([line(17)],'C001')).isValid,false);});
+test('customer and item matching still protect base document links',async t=>{mockSource(t);assert.equal((await delivery.validateDeliveryBaseDocumentLines([line(17)],'OTHER')).isValid,false);assert.equal((await delivery.validateDeliveryBaseDocumentLines([{...line(17),itemNo:'OTHER'}],'C001')).isValid,false);});
+test('invalid/zero quantities and unsupported base types stay rejected',async t=>{mockSource(t);for(const input of [line(17,0),line(17,'bad'),line(999)])assert.equal((await delivery.validateDeliveryBaseDocumentLines([input],'C001')).isValid,false);});
+test('reserve-invoice balances keep their separate quantity cap',async t=>{mockSource(t);assert.equal((await delivery.validateDeliveryBaseDocumentLines([line(13)],'C001')).isValid,false);});
+test('Sales Order -> AR Invoice may increase while Delivery -> AR Invoice stays capped',async t=>{mockSource(t);assert.deepEqual(await ar.validateARInvoiceBaseDocuments([line(17)]),{isValid:true});await assert.rejects(ar.validateARInvoiceBaseDocuments([line(15)]),/exceeds open quantity/);});
+test('Purchase Order -> AP Invoice may increase while GRPO -> AP Invoice stays capped',async t=>{mockSource(t);assert.deepEqual(await ap.validateAPInvoiceBaseDocuments([line(22)]),{isValid:true});await assert.rejects(ap.validateAPInvoiceBaseDocuments([line(20)]),/exceeds open quantity/);});
+test('the shared policy allows order receipts and never opens credit/production flows',()=>{assert.equal(allowsBaseQuantityIncrease(20,22),true);assert.equal(allowsBaseQuantityIncrease('15','17'),true);for(const [target,base] of [[14,13],[19,18],[15,13],[13,15],[18,20],[59,202],[15,undefined]])assert.equal(allowsBaseQuantityIncrease(target,base),false);});

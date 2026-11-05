@@ -1,0 +1,527 @@
+const { buildPurchaseDocumentAddressPayload } = require('./purchaseDocumentAddressPayloadUtils');
+const { buildDocumentLogisticsPayload } = require('./documentLogisticsPayloadUtils');
+const { buildDocumentConfirmationPayload, updateDocumentConfirmationOnly } = require('./documentConfirmationUtils');
+const sapService = require('./sapService');
+const { buildDocumentRoundingPayload } = require('./documentRoundingPayloadUtils');
+const purchaseOrderDb = require('./purchaseOrderDbService');
+const { getDocumentFreightCharges } = require('./freightChargesDbService');
+const { buildDocumentAdditionalExpenses } = require('./freightPayloadUtils');
+const { buildDocumentSeriesPayload } = require('./documentSeriesPayloadUtils');
+const { buildDocumentReferencesPayload } = require('./documentReferencesPayloadUtils');
+const { getUdfDefinitions } = require('./udfMetadataService');
+const { isSapUdfKey, normalizeUdfValues } = require('./udfPayloadUtils');
+const { buildDocumentLineUdfValues } = require('./documentLineUdfPayloadUtils');
+const {
+  applySapDocumentCurrency,
+  loadCompanyCurrencyContext,
+  loadDocumentCurrencyReferenceData,
+  mergeCurrencyReferenceData,
+  normalizeCopyDocumentRate,
+} = require('./salesDocumentCurrencyService');
+
+// ───────── HELPERS ─────────
+
+const formatDateForInput = (value) => {
+  if (!value) return '';
+  return String(value).split('T')[0];
+};
+
+const formatDocumentStatus = (value) => {
+  const normalized = String(value || '').trim();
+  if (normalized === 'bost_Open') return 'Open';
+  if (normalized === 'bost_Close') return 'Closed';
+  if (normalized === 'bost_Paid') return 'Paid';
+  return normalized;
+};
+
+const getUdfDefinitionsByKey = async (tableId) => {
+  const definitions = await getUdfDefinitions(tableId);
+  return new Map(definitions.map((field) => [field.key, field]));
+};
+
+// ───────── REFERENCE DATA (USING ODBC) ─────────
+
+const getReferenceData = async (companyId, userId) => {
+  try {
+    const [data, currencyContext] = await Promise.all([
+      purchaseOrderDb.getReferenceData(),
+      loadCompanyCurrencyContext(),
+    ]);
+    return mergeCurrencyReferenceData(data, currencyContext);
+  } catch (error) {
+    // Return empty structure with warnings
+    return {
+      company: '',
+      vendors: [],
+      items: [],
+      warehouses: [],
+      warehouse_addresses: [],
+      payment_terms: [],
+      shipping_types: [],
+      branches: [],
+      tax_codes: [],
+      uom_groups: [],
+      contacts: [],
+      pay_to_addresses: [],
+      ship_to_addresses: [],
+      bill_to_addresses: [],
+      company_address: {},
+      decimal_settings: {
+        QtyDec: 2,
+        PriceDec: 2,
+        SumDec: 2,
+        RateDec: 2,
+        PercentDec: 2
+      },
+      line_field_metadata: { matrix_columns: [], sap_form: {} },
+      warnings: [`Failed to load reference data: ${error.message}`],
+    };
+  }
+};
+
+// ───────── VENDOR DETAILS (USING ODBC) ─────────
+
+const getVendorDetails = async (vendorCode) => {
+  try {
+    // Use ODBC/Direct SQL for GET operations
+    const data = await purchaseOrderDb.getVendorDetails(vendorCode);
+    return data;
+  } catch (error) {
+    console.error('[Purchase Order Service] Failed to load vendor details:', error);
+    throw error;
+  }
+};
+
+// ───────── PURCHASE ORDER LIST (USING ODBC) ─────────
+
+const getPurchaseOrderList = async ({
+  query = '',
+  openOnly = false,
+  docNum = '',
+  vendorCode = '',
+  vendorName = '',
+  status = '',
+  postingDateFrom = '',
+  postingDateTo = '',
+  page = 1,
+  pageSize = 25,
+} = {}) => {
+  try {
+    // Use ODBC for reading list
+    const result = await purchaseOrderDb.getPurchaseOrderList({
+      query,
+      openOnly,
+      docNum,
+      vendorCode,
+      vendorName,
+      status,
+      postingDateFrom,
+      postingDateTo,
+      page,
+      pageSize,
+    });
+    return result;
+  } catch (error) {
+    return {
+      orders: [],
+      pagination: {
+        page: Math.max(1, Number(page) || 1),
+        pageSize: Math.min(200, Math.max(1, Number(pageSize) || 25)),
+        totalCount: 0,
+        totalPages: 1,
+      },
+    };
+  }
+};
+
+const getVendorFilterOptions = async ({
+  query = '',
+  vendorCode = '',
+  vendorName = '',
+  top,
+  display = 'code',
+} = {}) => {
+  try {
+    const rows = await purchaseOrderDb.searchVendors({
+      query,
+      cardCode: vendorCode,
+      cardName: vendorName,
+      top,
+      sortBy: display === 'name' ? 'name' : 'code',
+    });
+
+    return {
+      options: rows.map((row) => ({
+        code: display === 'name'
+          ? String(row.CardName || '').trim()
+          : String(row.CardCode || '').trim(),
+        name: display === 'name'
+          ? String(row.CardCode || '').trim()
+          : String(row.CardName || '').trim(),
+      })).filter((option) => option.code),
+    };
+  } catch (_error) {
+    return { options: [] };
+  }
+};
+
+// ───────── GET SINGLE ORDER (USING ODBC) ─────────
+
+const getPurchaseOrder = async (docEntry) => {
+  try {
+    // Use ODBC for reading single order
+    const result = await purchaseOrderDb.getPurchaseOrder(docEntry);
+    return normalizeCopyDocumentRate(result, await loadDocumentCurrencyReferenceData());
+  } catch (error) {
+    throw error;
+  }
+};
+
+// ───────── DOCUMENT SERIES (USING ODBC) ─────────
+
+const getDocumentSeries = async (targetDate = null, options = {}) => {
+  try {
+    const result = await purchaseOrderDb.getDocumentSeries(targetDate, options);
+    return result;
+  } catch (error) {
+    console.error('[PurchaseOrderService] Failed to load live SAP B1 purchase order series:', error.message);
+    throw error;
+  }
+};
+
+const getNextNumber = async (series) => {
+  try {
+    const result = await purchaseOrderDb.getNextNumber(series);
+    return result;
+  } catch (error) {
+    return { nextNumber: null };
+  }
+};
+
+// ───────── STATE FROM ADDRESS (USING ODBC) ─────────
+
+const getStateFromAddress = async (vendorCode, addressCode) => {
+  try {
+    const result = await purchaseOrderDb.getStateFromAddress(vendorCode, addressCode);
+    return result;
+  } catch (error) {
+    return { state: '' };
+  }
+};
+
+const getStateFromWarehouse = async (whsCode) => {
+  try {
+    const result = await purchaseOrderDb.getStateFromWarehouse(whsCode);
+    return result;
+  } catch (error) {
+    return { state: '' };
+  }
+};
+
+// ───────── CREATE ORDER (USING SERVICE LAYER) ─────────
+
+const toNumberOrUndefined = (value) => {
+  if (value === '' || value === null || value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const isTruthyFlag = (value) => (
+  value === true || value === 1 || ['Y', 'YES', 'TRUE', '1'].includes(String(value ?? '').trim().toUpperCase())
+);
+const toSapYesNo = (value, defaultValue = false) => {
+  if (value === '' || value === null || value === undefined) {
+    return defaultValue ? 'tYES' : 'tNO';
+  }
+
+  const normalized = String(value).trim().toUpperCase();
+  if (['Y', 'YES', 'TRUE', '1', 'TYES'].includes(normalized)) return 'tYES';
+  if (['N', 'NO', 'FALSE', '0', 'TNO'].includes(normalized)) return 'tNO';
+
+  return value ? 'tYES' : 'tNO';
+};
+
+const cleanObject = (value) => {
+  if (Array.isArray(value)) {
+    return value
+      .map(cleanObject)
+      .filter((item) => item !== undefined);
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.entries(value).reduce((acc, [key, nestedValue]) => {
+      const cleanedValue = cleanObject(nestedValue);
+      const preserveNullUdf = isSapUdfKey(key) && cleanedValue === null;
+      const isEmptyObject =
+        cleanedValue &&
+        typeof cleanedValue === 'object' &&
+        !Array.isArray(cleanedValue) &&
+        Object.keys(cleanedValue).length === 0;
+
+      if (
+        cleanedValue === undefined ||
+        (cleanedValue === null && !preserveNullUdf) ||
+        cleanedValue === '' ||
+        isEmptyObject
+      ) {
+        return acc;
+      }
+
+      acc[key] = cleanedValue;
+      return acc;
+    }, {});
+  }
+
+  return value;
+};
+
+const buildDocumentLines = async (lines = []) => {
+  // Resolved once per save so every line maps its UDFs onto the names this
+  // company database actually defines on POR1.
+  const lineUdfDefinitionsByKey = await getUdfDefinitionsByKey('POR1');
+  return Promise.all(lines
+    .filter((line) => String(line.itemNo || '').trim())
+    .map(async (line, index) => {
+      const rawUomEntry = Number(line.uomEntry ?? line.UoMEntry);
+      const usesManualUom = isTruthyFlag(line.uomNameEdited)
+        || (Number.isInteger(rawUomEntry) && rawUomEntry < 0);
+      const uomValue = usesManualUom
+        ? (line.uomName ?? line.UoMName ?? line.UomName ?? line.UnitMsr ?? line.unitMsr ?? line.uomCode)
+        : (line.uomEntry ?? line.UoMEntry ?? line.uomName ?? line.UoMName ?? line.UomName ?? line.UnitMsr ?? line.unitMsr ?? line.uomCode);
+      const resolvedUomEntry = usesManualUom
+        ? null
+        : await purchaseOrderDb.resolvePurchaseOrderLineUomEntry(line.itemNo, uomValue);
+      const resolvedUsesManualUom = usesManualUom
+        || (Number.isInteger(resolvedUomEntry) && resolvedUomEntry < 0);
+
+      if (!resolvedUsesManualUom && (resolvedUomEntry === null || resolvedUomEntry === undefined)) {
+        const displayLine = index + 1;
+        const requestedUom = String(uomValue || '').trim();
+        throw new Error(
+          requestedUom
+            ? `Line ${displayLine}: UoM "${requestedUom}" is not valid for item "${line.itemNo}".`
+            : `Line ${displayLine}: Specify a UoM for item "${line.itemNo}".`
+        );
+      }
+
+      const documentLine = cleanObject({
+  ItemCode: line.itemNo,
+  ItemDescription: line.itemDescription,
+  Quantity: toNumberOrUndefined(line.quantity),
+  UnitPrice: toNumberOrUndefined(line.unitPrice),
+  Price: toNumberOrUndefined(line.unitPrice),
+  DiscountPercent: toNumberOrUndefined(line.stdDiscount),
+  TaxCode: line.taxCode,
+  WarehouseCode: line.whse,
+  UoMEntry: resolvedUsesManualUom ? undefined : (resolvedUomEntry ?? undefined),
+  CostingCode: line.distRule,
+  CountryOrg: line.countryOfOrigin,
+  LocationCode: toNumberOrUndefined(line.loc),
+  SACEntry: toNumberOrUndefined(line.sac),
+  AgreementNo: toNumberOrUndefined(line.blanketAgreementNo),
+  RequiredDate: line.requiredDate || undefined,
+  PackageQuantity: toNumberOrUndefined(
+    line.noOfPackages ?? line.NoOfPackages ?? line.packageQuantity ?? line.PackageQuantity ?? line.PackQty
+  ),
+
+  // SAP spelling is intentionally "Commision"
+  CommisionPercent: toNumberOrUndefined(line.commPercent),
+});
+      if (resolvedUsesManualUom && String(uomValue || '').trim()) {
+        documentLine.MeasureUnit = String(uomValue).trim();
+      }
+      Object.assign(documentLine, buildDocumentLineUdfValues(line, { definitions: lineUdfDefinitionsByKey }));
+
+      const hasBaseLink =
+        line.baseEntry != null &&
+        line.baseEntry !== '' &&
+        line.baseType != null &&
+        line.baseType !== '' &&
+        line.baseLine != null &&
+        line.baseLine !== '';
+
+      if (hasBaseLink) {
+        documentLine.BaseEntry = parseInt(line.baseEntry, 10);
+        documentLine.BaseType = parseInt(line.baseType, 10);
+        documentLine.BaseLine = parseInt(line.baseLine, 10);
+      }
+
+      return documentLine;
+    }));
+};
+
+const buildPurchaseOrderPayload = async (
+  { header = {}, lines = [], header_udfs = {}, freightCharges = [], reference_documents = [] },
+) => {
+  const sapPayload = cleanObject({
+    CardCode: header.vendor,
+    NumAtCard: header.salesContractNo,
+    DocDate: header.postingDate || header.documentDate,
+    DocDueDate: header.deliveryDate || header.postingDate || header.documentDate,
+    TaxDate: header.documentDate || header.postingDate,
+    ...buildDocumentSeriesPayload(header),
+    BPL_IDAssignedToInvoice: header.branch ? Number(header.branch) : undefined,
+    PaymentGroupCode: header.paymentTerms ? Number(header.paymentTerms) : undefined,
+    SalesPersonCode: header.salesEmployee !== '' && header.salesEmployee != null ? toNumberOrUndefined(header.salesEmployee) : undefined,
+    ShipToCode: header.shipToCode || undefined,
+    PayToCode: header.payToCode || undefined,
+    Address: header.billToAddress || header.billTo || undefined,
+    Address2: header.payToAddress || header.payTo || undefined,
+    TransportationCode: toNumberOrUndefined(header.shippingType),
+    LanguageCode: String(header.language || '') === '-1' ? undefined : toNumberOrUndefined(header.language),
+    Comments: header.otherInstruction,
+    JournalMemo: header.journalRemark,
+    ...buildDocumentConfirmationPayload(header),
+    DiscountPercent: toNumberOrUndefined(header.discount),
+    ...buildDocumentRoundingPayload(header),
+    DocumentAdditionalExpenses: buildDocumentAdditionalExpenses(freightCharges),
+    DocumentReferences: buildDocumentReferencesPayload(reference_documents),
+    DocumentLines: await buildDocumentLines(lines),
+      ...buildDocumentLogisticsPayload(header),
+      ...buildPurchaseDocumentAddressPayload(header),
+    });
+
+  const headerUdfDefinitionsByKey = await getUdfDefinitionsByKey('OPOR');
+  const headerUdfValues = {
+    ...header_udfs,
+    ...(header.buyerLocation !== undefined ? { U_ShipLocation: header.buyerLocation } : {}),
+  };
+  Object.assign(sapPayload, normalizeUdfValues(headerUdfValues, null, headerUdfDefinitionsByKey));
+  applySapDocumentCurrency(
+    sapPayload,
+    header,
+    await loadDocumentCurrencyReferenceData(header),
+  );
+  return sapPayload;
+};
+
+const validatePurchaseOrderPayload = async ({ header = {}, lines = [] }) => {
+  const vendorCode = String(header.vendor || '').trim();
+  if (!vendorCode) {
+    throw new Error('Vendor is required before submitting the purchase order.');
+  }
+
+  const itemCodes = Array.from(
+    new Set(
+      lines
+        .map((line) => String(line.itemNo || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!itemCodes.length) {
+    throw new Error('At least one item line is required before submitting the purchase order.');
+  }
+};
+
+const submitPurchaseOrder = async (payload) => {
+  await validatePurchaseOrderPayload(payload);
+  const purchaseOrderPayload = await buildPurchaseOrderPayload(payload);
+
+  const response = await sapService.request({
+    method: 'post',
+    url: '/PurchaseOrders',
+    data: purchaseOrderPayload,
+  });
+
+  return {
+    message: 'Purchase order posted successfully.',
+    doc_num: response.data?.DocNum,
+    doc_entry: response.data?.DocEntry,
+    sap_response: response.data,
+  };
+};
+
+// ───────── UPDATE ORDER (USING SERVICE LAYER) ─────────
+
+const updatePurchaseOrder = async (docEntry, payload) => {
+  const confirmationResult = await updateDocumentConfirmationOnly(docEntry, payload, 'PurchaseOrders', sapService);
+  if (confirmationResult) return confirmationResult;
+  await validatePurchaseOrderPayload(payload);
+  const purchaseOrderPayload = await buildPurchaseOrderPayload(payload);
+
+  const response = await sapService.request({
+    method: 'patch',
+    url: `/PurchaseOrders(${docEntry})`,
+    data: purchaseOrderPayload,
+  });
+
+  return {
+    message: 'Purchase order updated successfully.',
+    doc_num: response.data?.DocNum,
+    doc_entry: docEntry,
+    sap_response: response.data,
+  };
+};
+
+// ───────── EXPORTS ─────────
+
+const getItemsForModal = async () => {
+  try {
+    const result = await purchaseOrderDb.getItemsForModal();
+    return { items: result };
+  } catch (error) {
+    throw new Error('Failed to fetch items: ' + error.message);
+  }
+};
+
+const getFreightCharges = async (docEntry) => {
+  try {
+    const freightCharges = await getDocumentFreightCharges('POR3', docEntry);
+    return { freightCharges };
+  } catch (_error) {
+    return { freightCharges: [] };
+  }
+};
+
+const getOpenPurchaseQuotations = async (vendorCode = null) => {
+  try {
+    const purchaseQuotationDb = require('./purchaseQuotationDbService');
+    const documents = await purchaseQuotationDb.getOpenPurchaseQuotations(vendorCode);
+    return { documents };
+  } catch (_error) {
+    return { documents: [] };
+  }
+};
+
+const getPurchaseQuotationForCopy = async (docEntry) => {
+  const purchaseQuotationDb = require('./purchaseQuotationDbService');
+  return normalizeCopyDocumentRate(
+    await purchaseQuotationDb.getPurchaseQuotationForCopy(docEntry),
+    await loadDocumentCurrencyReferenceData(),
+  );
+};
+
+const getOpenPurchaseRequests = async (vendorCode = null) => {
+  try {
+    const purchaseRequestService = require('./purchaseRequestService');
+    return await purchaseRequestService.getOpenPurchaseRequests(vendorCode);
+  } catch (_error) {
+    return { documents: [] };
+  }
+};
+
+const getPurchaseRequestForCopy = async (docEntry) => {
+  const purchaseRequestService = require('./purchaseRequestService');
+  return purchaseRequestService.getPurchaseRequestForCopy(docEntry);
+};
+
+module.exports = {
+  getReferenceData,
+  getVendorDetails,
+  getVendorFilterOptions,
+  getPurchaseOrderList,
+  getPurchaseOrder,
+  submitPurchaseOrder,
+  updatePurchaseOrder,
+  getDocumentSeries,
+  getNextNumber,
+  getStateFromAddress,
+  getStateFromWarehouse,
+  getOpenPurchaseQuotations,
+  getPurchaseQuotationForCopy,
+  getOpenPurchaseRequests,
+  getPurchaseRequestForCopy,
+  getItemsForModal,
+  getFreightCharges,
+};

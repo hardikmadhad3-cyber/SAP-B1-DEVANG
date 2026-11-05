@@ -1,0 +1,187 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const salesOrderDb = require('../services/salesOrderDbService');
+const {
+  _buildDocumentRoundingPayload,
+  _buildDocumentLinePayload,
+  _mergeCompanyCurrencyRows,
+  _resolveSalesOrderDocumentCurrency,
+} = require('../services/SalesOrderService');
+
+const originalResolveSalesOrderLineUomEntry = salesOrderDb.resolveSalesOrderLineUomEntry;
+
+test.before(() => {
+  salesOrderDb.resolveSalesOrderLineUomEntry = async () => null;
+});
+
+test.after(() => {
+  salesOrderDb.resolveSalesOrderLineUomEntry = originalResolveSalesOrderLineUomEntry;
+});
+
+test('does not inject warehouse or tax defaults from another SAP company', async () => {
+  const payload = await _buildDocumentLinePayload({
+    itemNo: 'ITEM-01',
+    quantity: '1',
+    unitPrice: '25',
+    whse: '',
+    taxCode: '',
+  }, { rdr1FieldMetadata: {} });
+
+  assert.equal(payload.WarehouseCode, '');
+  assert.equal(payload.TaxCode, undefined);
+  assert.notEqual(payload.WarehouseCode, '01');
+  assert.notEqual(payload.TaxCode, 'IGST5');
+});
+
+test('loads SAP line Price when PriceBefDi is zero for a Sales BOM parent', () => {
+  assert.equal(salesOrderDb._resolveSavedLineUnitPrice({
+    PriceBefDi: 0,
+    Price: 1200,
+  }), '1200');
+});
+
+test('uses only selected-company currencies without injecting INR or a common-currency list', () => {
+  const currencies = _mergeCompanyCurrencyRows({
+    currencies: [
+      { CurrCode: 'JPY', CurrName: 'Japanese Yen' },
+      { CurrCode: 'sgd', CurrName: 'Singapore Dollar' },
+    ],
+    localCurrency: 'SGD',
+    systemCurrency: 'USD',
+  });
+
+  assert.deepEqual(currencies, [
+    { CurrCode: 'JPY', CurrName: 'Japanese Yen' },
+    { CurrCode: 'sgd', CurrName: 'Singapore Dollar' },
+    { CurrCode: 'USD', CurrName: 'USD' },
+  ]);
+  assert.equal(currencies.some(({ CurrCode }) => CurrCode === 'INR'), false);
+  assert.equal(currencies.some(({ CurrCode }) => CurrCode === 'EUR'), false);
+});
+
+test('resolves a missing payload currency from the selected company and business partner', () => {
+  const referenceData = {
+    local_currency: 'SGD',
+    system_currency: 'USD',
+    vendors: [
+      { CardCode: 'C-USD', Currency: 'USD' },
+      { CardCode: 'C-ALL', Currency: '##' },
+    ],
+  };
+
+  assert.equal(_resolveSalesOrderDocumentCurrency({ vendor: 'C-USD' }, referenceData), 'USD');
+  assert.equal(_resolveSalesOrderDocumentCurrency({ vendor: 'C-ALL' }, referenceData), 'SGD');
+  assert.equal(_resolveSalesOrderDocumentCurrency({ vendor: 'C-ALL', currencyMode: 'SYSTEM' }, referenceData), 'USD');
+  assert.equal(_resolveSalesOrderDocumentCurrency({ vendor: 'C-USD', currency: 'EUR' }, referenceData), 'EUR');
+});
+
+test('lets SAP calculate the Sales Order rounding difference for its company', () => {
+  assert.deepEqual(_buildDocumentRoundingPayload({
+    rounding: true,
+    roundingAmount: '-0.3776',
+  }), {
+    Rounding: 'tYES',
+  });
+});
+
+test('clears a stale Sales Order rounding difference when rounding is disabled', () => {
+  assert.deepEqual(_buildDocumentRoundingPayload({
+    rounding: false,
+    roundingAmount: '-0.3776',
+  }), {
+    Rounding: 'tNO',
+    RoundingDiffAmount: 0,
+  });
+});
+
+test('serializes editable Sales Order line fields to their Service Layer properties', async () => {
+  const payload = await _buildDocumentLinePayload({
+    itemNo: 'ITEM-02',
+    itemDescription: 'Saved description',
+    quantity: '3',
+    unitPrice: '12.5',
+    whse: 'W-02',
+    taxCode: 'GST12',
+    uomCode: 'BOX',
+    cogsDistRule: 'COGS-1',
+    cogsDistRule2: 'COGS-2',
+    glAccount: '410000',
+    loc: '7',
+    blanketAgreementNo: '44',
+    blanketAgreementLine: '5',
+    commPercent: '2.75',
+    wTaxLiable: false,
+    withoutQtyPosting: true,
+  }, {
+    rdr1FieldMetadata: {
+      CogsOcrCod: 'nvarchar',
+      CogsOcrCo2: 'nvarchar',
+      AcctCode: 'nvarchar',
+      LocCode: 'int',
+      AgrNo: 'int',
+      AgrLnNum: 'int',
+      CommPercent: 'numeric',
+      WtLiable: 'char',
+      NoInvtryMv: 'char',
+    },
+  });
+
+  assert.equal(payload.ItemDescription, 'Saved description');
+  assert.equal(payload.WarehouseCode, 'W-02');
+  assert.equal(payload.TaxCode, 'GST12');
+  assert.equal(payload.UoMCode, 'BOX');
+  assert.equal(payload.COGSCostingCode, 'COGS-1');
+  assert.equal(payload.COGSCostingCode2, 'COGS-2');
+  assert.equal(payload.AccountCode, '410000');
+  assert.equal(payload.LocationCode, 7);
+  assert.equal(payload.AgreementNo, 44);
+  assert.equal(payload.AgreementRowNumber, 5);
+  assert.equal(payload.CommissionPercent, 2.75);
+  assert.equal(payload.WTLiable, 'tNO');
+  assert.equal(payload.WithoutInventoryMovement, 'tYES');
+});
+
+test('persists the entered price in the configured UDF for a Sales BOM parent', async () => {
+  const payload = await _buildDocumentLinePayload({
+    itemNo: 'KIT-01',
+    quantity: '2',
+    unitPrice: '1200',
+    whse: 'W-01',
+    bomType: 'S',
+    bomRole: 'parent',
+  }, {
+    rdr1FieldMetadata: { U_Unit_Price: 'numeric', U_PRICE: 'numeric' },
+  });
+
+  assert.equal(payload.UnitPrice, 1200);
+  assert.equal(payload.U_Unit_Price, 1200);
+  assert.equal(payload.U_PRICE, 1200);
+});
+
+test('omits optional RDR1 properties that the selected company does not expose', async () => {
+  const payload = await _buildDocumentLinePayload({
+    itemNo: 'ITEM-03',
+    quantity: '1',
+    unitPrice: '10',
+    whse: 'W-01',
+    lineDeliveryDate: '2026-08-30',
+    lineShippingType: '4',
+    taxLiable: true,
+    hsnCode: '1001',
+    sacCode: '9983',
+  }, { rdr1FieldMetadata: {} });
+
+  assert.equal(payload.ShipDate, undefined);
+  assert.equal(payload.ShippingMethod, undefined);
+  assert.equal(payload.TaxOnly, undefined);
+  assert.equal(payload.HSNEntry, undefined);
+  assert.equal(payload.SACEntry, undefined);
+});
+
+test('invalid numeric Sales Order UDFs reject the payload instead of silently disappearing', async () => {
+  await assert.rejects(() => _buildDocumentLinePayload({
+    itemNo: 'ITEM-03', quantity: 1, unitPrice: 25, udf: { U_GrossWt: 'heavy' },
+  }, { rdr1FieldMetadata: { U_GrossWt: 'decimal' } }), { code: 'SAP_UDF_INVALID_VALUE' });
+});

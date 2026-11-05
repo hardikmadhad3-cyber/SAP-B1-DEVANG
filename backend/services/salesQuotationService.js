@@ -1,0 +1,827 @@
+const { buildDocumentLogisticsPayload } = require('./documentLogisticsPayloadUtils');
+const { buildDocumentConfirmationPayload, updateDocumentConfirmationOnly } = require('./documentConfirmationUtils');
+const sapService = require('./sapService');
+const salesQuotationDb = require('./salesQuotationDbService');
+const salesOrderDb = require('./salesOrderDbService');
+const { buildDocumentAdditionalExpenses } = require('./freightPayloadUtils');
+const { buildDocumentRoundingPayload } = require('./documentRoundingPayloadUtils');
+const { buildMarketingDocumentAddressPayload } = require('./documentAddressPayloadUtils');
+const { getUdfDefinitions } = require('./udfMetadataService');
+const { normalizeUdfValue, normalizeUdfValues, applyUdfsRobust } = require('./udfPayloadUtils');
+const { buildDocumentSeriesPayload } = require('./documentSeriesPayloadUtils');
+const hsnCodeDbService = require('./hsnCodeDbService');
+const {
+  applySapDocumentCurrency,
+  fromStoredDocumentRate,
+  loadCompanyCurrencyContext,
+  mergeCurrencyReferenceData,
+  normalizeCopyDocumentRateForCompany,
+} = require('./salesDocumentCurrencyService');
+const {
+  assignMappedUdfValue,
+  buildMetadataValidatedStandardLine,
+  compactDocumentLinePayload,
+  filterMetadataValidatedUdfDefinitions,
+  filterMetadataValidatedUdfs,
+  getLineValue,
+  intersectPhysicalUdfKeys,
+} = require('./salesDocumentLinePayloadUtils');
+
+const normalizeBranchId = (branch) => {
+  const normalized = String(branch ?? '').trim();
+  const branchId = Number(normalized);
+  return Number.isInteger(branchId) && branchId > 0 ? branchId : undefined;
+};
+
+const resolveSubmittedBranchId = (header = {}, lines = [], refData = {}) => {
+  const selectedBranchId = normalizeBranchId(header.branch);
+  if (selectedBranchId !== undefined) return selectedBranchId;
+
+  const firstLine = Array.isArray(lines) ? lines.find((line) => String(line?.itemNo || line?.ItemCode || '').trim()) || {} : {};
+  const warehouseCode = String(
+    header.warehouse || firstLine.whse || firstLine.warehouse || firstLine.WarehouseCode || firstLine.WhsCode || '',
+  ).trim();
+  if (!warehouseCode) return undefined;
+
+  const warehouseSources = [
+    ...(Array.isArray(refData.warehouses) ? refData.warehouses : []),
+    ...(Array.isArray(refData.warehouse_addresses) ? refData.warehouse_addresses : []),
+  ];
+  const warehouse = warehouseSources.find((entry) => (
+    String(entry?.WhsCode || entry?.WarehouseCode || '').trim().toUpperCase() === warehouseCode.toUpperCase()
+  ));
+
+  return normalizeBranchId(
+    warehouse?.BranchID ?? warehouse?.BPLId ?? warehouse?.BPLID ?? warehouse?.BPLid ?? warehouse?.branchId,
+  );
+};
+
+const hasValue = (value) => value !== '' && value !== null && value !== undefined;
+
+const normalizeTextValue = (value) => (value === undefined || value === null ? '' : String(value).trim());
+
+const normalizeAddressList = (addresses) => (Array.isArray(addresses) ? addresses : []);
+
+const findAddressByCode = (addresses, value) => {
+  const normalizedValue = normalizeTextValue(value).toUpperCase();
+  if (!normalizedValue) return undefined;
+  return normalizeAddressList(addresses).find((address) => (
+    normalizeTextValue(address?.Address || address?.AddressName).toUpperCase() === normalizedValue
+  ));
+};
+
+const validateSubmittedBranch = (branchId, refData = {}) => {
+  const configuredBranchIds = (Array.isArray(refData.branches) ? refData.branches : [])
+    .map((branch) => normalizeBranchId(
+      branch?.BPLId ?? branch?.BPLID ?? branch?.BPLid ?? branch?.BranchID ?? branch?.branchId,
+    ))
+    .filter((branch) => branch !== undefined);
+
+  if (!configuredBranchIds.length) return;
+  if (branchId === undefined) {
+    const error = new Error('Select a branch before submitting a Sales Quotation.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!configuredBranchIds.includes(branchId)) {
+    const error = new Error('The selected branch is not available for this SAP company. Refresh the form and select a valid branch.');
+    error.statusCode = 400;
+    throw error;
+  }
+};
+
+const firstAddressCode = (addresses) => {
+  const address = normalizeAddressList(addresses).find((entry) => normalizeTextValue(entry?.Address || entry?.AddressName));
+  return address ? normalizeTextValue(address.Address || address.AddressName) : undefined;
+};
+
+const normalizeSubmittedAddressHeader = (header = {}, customerDetails = {}) => {
+  const billToAddresses = normalizeAddressList(
+    customerDetails.bill_to_addresses || customerDetails.pay_to_addresses || customerDetails.billTo,
+  );
+  const shipToAddresses = normalizeAddressList(customerDetails.ship_to_addresses || customerDetails.shipTo);
+  const submittedShipToCode = normalizeTextValue(header.shipToCode);
+  const submittedPayToCode = normalizeTextValue(header.billToCode || header.payToCode);
+  const validShipTo = findAddressByCode(shipToAddresses, submittedShipToCode);
+  const validPayTo = findAddressByCode(billToAddresses, submittedPayToCode);
+  const shipToCode = validShipTo
+    ? normalizeTextValue(validShipTo.Address || validShipTo.AddressName)
+    : firstAddressCode(shipToAddresses);
+  const payToCode = validPayTo
+    ? normalizeTextValue(validPayTo.Address || validPayTo.AddressName)
+    : firstAddressCode(billToAddresses);
+
+  return {
+    ...header,
+    shipToCode,
+    billToCode: payToCode,
+    payToCode,
+  };
+};
+
+const getHeaderDiscountPercent = (header = {}) => {
+  const rawValue = header.discount ?? header.DiscountPercent ?? header.DiscPrcnt;
+  if (rawValue === undefined || rawValue === null) return undefined;
+  const textValue = String(rawValue).replace(/,/g, '').trim();
+  if (!textValue) return 0;
+  const parsed = Number(textValue);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const toSapYesNo = (value) => {
+  const normalized = String(value ?? '').trim().toUpperCase();
+  return ['Y', 'YES', 'TRUE', '1', 'TYES'].includes(normalized) ? 'tYES' : 'tNO';
+};
+
+const firstLineValueByAliases = (line = {}, aliases = []) => {
+  for (const alias of aliases) {
+    const value = line?.[alias] ?? line?.udf?.[alias];
+    if (hasValue(value)) return value;
+  }
+  return undefined;
+};
+
+const SALES_QUOTATION_LINE_UDF_MAPPINGS = [
+  { sapFields: ['U_PackingType', 'U_PACKINGTYPE', 'U_Packing_Type'], getValue: (line) => firstLineValueByAliases(line, ['U_PackingType', 'U_PACKINGTYPE', 'U_Packing_Type', 'U_PackingStatus', 'packingType']) },
+  { sapFields: ['U_TAXCODE', 'U_TaxCode'], getValue: (line) => firstLineValueByAliases(line, ['U_TAXCODE', 'U_TaxCode', 'taxCodeRepeat', 'taxCode']) },
+  { sapFields: ['U_PRICE', 'U_Price'], getValue: (line) => firstLineValueByAliases(line, ['U_PRICE', 'U_Price', 'price']) },
+  { sapField: 'U_Required_Date', getValue: (line) => line.requiredDate },
+  { sapField: 'U_ReqDate', getValue: (line) => line.requiredDate },
+  { sapField: 'U_Quoted_Date', getValue: (line) => line.quotedDate },
+  { sapField: 'U_QuoteDate', getValue: (line) => line.quotedDate },
+  { sapField: 'U_Req_Qty', getValue: (line) => line.requiredQty },
+  { sapField: 'U_ReqQty', getValue: (line) => line.requiredQty },
+  { sapField: 'U_SPLRBT', getValue: (line) => firstLineValueByAliases(line, ['specialRebate', 'U_SPLRBT', 'U_SpecialRebate']) },
+  { sapField: 'U_COMPRC', getValue: (line) => firstLineValueByAliases(line, ['commission', 'commision', 'U_COMPRC', 'U_Commision', 'U_Commission']) },
+  { sapField: 'U_S_BrokPerQty', getValue: (line) => firstLineValueByAliases(line, ['sellerBrokeragePerQty', 'brokPerQty', 'U_S_BrokPerQty', 'U_S_BROKPERQTY']) },
+  { sapField: 'U_Unit_Price', getValue: (line) => line.unitPriceUdf },
+  { sapField: 'U_Brok_Seller', getValue: (line) => firstLineValueByAliases(line, ['sellerBrokerage', 'U_Brok_Seller', 'U_BROK_SELLER']) },
+  { sapField: 'U_Brok_Buyer', getValue: (line) => firstLineValueByAliases(line, ['buyerBrokerage', 'U_Brok_Buyer', 'U_BROK_BUYER', 'U_Buyer_Brokerage']) },
+  { sapField: 'U_Buyer_Delivery', getValue: (line) => firstLineValueByAliases(line, ['buyerDelivery', 'U_Buyer_Delivery', 'U_BUYER_DELIVERY']) },
+  { sapField: 'U_Seller_Delivery', getValue: (line) => firstLineValueByAliases(line, ['sellerDelivery', 'U_Seller_Delivery', 'U_SELLER_DELIVERY']) },
+  { sapField: 'U_Buyer_Payment_Terms', getValue: (line) => firstLineValueByAliases(line, ['buyerPaymentTerms', 'buyerTermsOfPayment', 'U_Buyer_Payment_Terms', 'U_BUYER_PAYMENT_TERMS']) },
+  { sapField: 'U_Seller_Payment_Term', getValue: (line) => firstLineValueByAliases(line, ['sellerPaymentTerms', 'sellerPaymentTermsRepeat', 'sellerTermsOfPayment', 'U_Seller_Payment_Term', 'U_Seller_Payment_Terms', 'U_SELLER_PAYMENT_TERM', 'U_SELLER_PAYMENT_TERMS']) },
+  { sapField: 'U_Seller_Payment_Terms', getValue: (line) => firstLineValueByAliases(line, ['sellerPaymentTerms', 'sellerPaymentTermsRepeat', 'sellerTermsOfPayment', 'U_Seller_Payment_Term', 'U_Seller_Payment_Terms', 'U_SELLER_PAYMENT_TERM', 'U_SELLER_PAYMENT_TERMS']) },
+  { sapField: 'U_Buyer_Quality', getValue: (line) => firstLineValueByAliases(line, ['buyerQuality', 'U_Buyer_Quality', 'U_BUYER_QUALITY']) },
+  { sapField: 'U_Seller_Quality', getValue: (line) => firstLineValueByAliases(line, ['sellerQuality', 'U_Seller_Quality', 'U_SELLER_QUALITY']) },
+  { sapField: 'U_Buyer_Price', getValue: (line) => firstLineValueByAliases(line, ['buyerPrice', 'U_Buyer_Price', 'U_BUYER_PRICE']) },
+  { sapField: 'U_Seller_Price', getValue: (line) => firstLineValueByAliases(line, ['sellerPrice', 'U_Seller_Price', 'U_SELLER_PRICE']) },
+  { sapField: 'U_Buyer_SPINS', getValue: (line) => firstLineValueByAliases(line, ['buyerSpecialInstruction', 'deliverySpecialInstruction', 'U_Buyer_SPINS', 'U_BUYER_SPINS']) },
+  { sapField: 'U_Seller_SPINS', getValue: (line) => firstLineValueByAliases(line, ['sellerSpecialInstruction', 'qtySpecialInstruction', 'U_Seller_SPINS', 'U_SELLER_SPINS']) },
+  { sapField: 'U_Sel_Brok_AP', getValue: (line) => firstLineValueByAliases(line, ['sellerBrokerageAmtPer', 'sellerBrokerageAmountPer', 'U_Sel_Brok_AP', 'U_SEL_BROK_AP']) },
+  { sapField: 'U_Seller_Brok_Per', getValue: (line) => firstLineValueByAliases(line, ['sellerBrokeragePercent', 'sellerBrokeragePercentage', 'U_Seller_Brok_Per', 'U_SELLER_BROK_PER']) },
+  { sapField: 'U_Buyer_Bill_Disc', getValue: (line) => line.buyerBillDiscount },
+  { sapField: 'U_Seller_Bill_Disc', getValue: (line) => line.sellerBillDiscount },
+  { sapField: 'U_SELLTCODE', getValue: (line) => firstLineValueByAliases(line, ['stcode', 'STCODE', 'U_SELLTCODE', 'U_STCODE']) },
+  { sapField: 'U_S_Item', getValue: (line) => firstLineValueByAliases(line, ['sellerItem', 'U_S_Item', 'U_S_ITEM', 'U_SItem']) },
+  { sapField: 'U_S_Qty', getValue: (line) => firstLineValueByAliases(line, ['sellerQty', 'sellerQuantity', 'U_S_Qty', 'U_S_QTY']) },
+  { sapFields: ['U_Fix_Brock_B', 'U_Fix_Brok_B', 'U_FIX_BROK_BUYER', 'U_FIXBROKBUYER'], getValue: (line) => firstLineValueByAliases(line, ['U_Fix_Brock_B', 'U_Fix_Brok_B', 'U_FIX_BROK_BUYER', 'U_FIXBROKBUYER', 'fixBrokBuyer']) },
+  { sapFields: ['U_Fix_Brock_S', 'U_Fix_Brok_S', 'U_Fix_Brock_Seller', 'U_FIXBROCKSELLER', 'U_FIXBROKSELLER'], getValue: (line) => firstLineValueByAliases(line, ['U_Fix_Brock_S', 'U_Fix_Brok_S', 'U_Fix_Brock_Seller', 'U_FIXBROCKSELLER', 'U_FIXBROKSELLER', 'fixBrockSeller']) },
+  { sapField: 'U_Freight_pur', getValue: (line) => line.freightPurchase },
+  { sapField: 'U_Freight_sales', getValue: (line) => line.freightSales },
+  { sapField: 'U_Fr_trans', getValue: (line) => line.freightProvider },
+  { sapField: 'U_Fr_trans_name', getValue: (line) => line.freightProviderName },
+  { sapField: 'U_BDNum', getValue: (line) => line.brokerageNumber },
+];
+
+const SALES_QUOTATION_LABEL_UDF_MAPPINGS = [
+  { labels: ['Allow Procmnt. Doc.', 'Allow Procurement Doc'], getValue: (line) => (line.allowProcurementDoc ? 'Y' : '') },
+  { labels: ['Required Date'], getValue: (line) => line.requiredDate },
+  { labels: ['Quoted Date'], getValue: (line) => line.quotedDate },
+  { labels: ['Required Qty.', 'Required Qty', 'Req Qty'], getValue: (line) => line.requiredQty },
+  { labels: ['Sauda Node Ref', 'Sauda Nodh Ref', 'Sauda Nodh No'], getValue: (line) => line.saudaNodeRef },
+  { labels: ['AP Inv DocKey'], getValue: (line) => line.apInvDocKey },
+  { labels: ['AP Inv DocNum'], getValue: (line) => line.apInvDocNum },
+  { labels: ['AP Inv LineNum'], getValue: (line) => line.apInvLineNum },
+  { labels: ['Assessable Value'], getValue: (line) => line.assessableValue },
+  { labels: ['BED Rate', 'BEDRATE'], getValue: (line) => line.bedRate },
+  { labels: ['BED Amount', 'BEDAMOUNT'], getValue: (line) => line.bedAmount },
+  { labels: ['RG23DNo', 'RG23DNO'], getValue: (line) => line.rg23dNo },
+  { labels: ['HSN'], getValue: (line) => line.hsnCode },
+  { labels: ['SAC'], getValue: (line) => line.sacCode },
+  { labels: ['Unit Price'], getValue: (line) => line.unitPriceUdf },
+  { labels: ['Seller - Terms of Payment'], getValue: (line) => line.sellerPaymentTerms },
+  { labels: ['Document Created'], getValue: (line) => line.documentCreated },
+];
+
+const compactLabel = (value) => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+const resolveAvailableUdfKey = (availableUdfKeys = new Set(), aliases = []) => {
+  const availableKeys = Array.from(availableUdfKeys || []);
+  for (const alias of aliases) {
+    if (availableUdfKeys.has(alias)) return alias;
+
+    const normalizedAlias = compactLabel(alias);
+    const matchedKey = availableKeys.find((key) => compactLabel(key) === normalizedAlias);
+    if (matchedKey) return matchedKey;
+  }
+  return '';
+};
+
+const getSalesQuotationLineUdfMetadata = async () => {
+  const definitions = await getUdfDefinitions('QUT1').catch((error) => {
+    console.warn('[Sales Quotation] Live QUT1 UDF metadata is unavailable; line UDFs will be omitted.', error.message);
+    return [];
+  });
+  const keys = new Set(definitions.map((field) => String(field.key || '').trim()));
+
+  return {
+    keys,
+    definitionsByKey: new Map(definitions.map((field) => [field.key, field])),
+    labelToKey: definitions.reduce((acc, field) => {
+      const key = compactLabel(field.label || field.key);
+      if (key && field.key) acc[key] = field.key;
+      return acc;
+    }, {}),
+  };
+};
+
+const getUdfDefinitionsByKey = async (tableId) => {
+  const definitions = await getUdfDefinitions(tableId).catch((error) => {
+    console.warn(`[Sales Quotation] Live ${tableId} UDF metadata is unavailable; UDFs will be omitted.`, error.message);
+    return [];
+  });
+  return new Map(definitions.map((field) => [field.key, field]));
+};
+
+const applySalesQuotationHeaderUdfs = async (sapPayload, payload = {}) => {
+  const [definitionsByKey, fieldMetadata] = await Promise.all([
+    getUdfDefinitionsByKey('OQUT'),
+    salesQuotationDb.getSalesQuotationHeaderFieldMetadata().catch((error) => {
+      console.warn('[Sales Quotation] Live OQUT field metadata is unavailable; header UDFs will be omitted.', error.message);
+      return {};
+    }),
+  ]);
+  const physicalDefinitionsByKey = filterMetadataValidatedUdfDefinitions(definitionsByKey, fieldMetadata);
+  const values = { ...(payload.header_udfs || {}) };
+  const placeOfSupplyKey = resolveAvailableUdfKey(
+    new Set(physicalDefinitionsByKey.keys()),
+    ['U_PlaceOfSupply', 'U_PLACE_OF_SUPPLY'],
+  );
+  if (placeOfSupplyKey && hasValue(payload.header?.placeOfSupply)) {
+    sapPayload[placeOfSupplyKey] = payload.header.placeOfSupply;
+  }
+  applyUdfsRobust(
+    sapPayload,
+    filterMetadataValidatedUdfs(values, new Set(physicalDefinitionsByKey.keys()), fieldMetadata),
+    physicalDefinitionsByKey,
+    false,
+  );
+};
+
+const buildValidatedLineUdfs = (line, udfMetadata) => {
+  const availableUdfKeys = udfMetadata.keys || new Set();
+  const udfs = {};
+
+  Object.entries(line.udf || {}).forEach(([key, value]) => {
+    const resolvedKey = resolveAvailableUdfKey(availableUdfKeys, [key]);
+    if (resolvedKey) udfs[resolvedKey] = normalizeUdfValue(value);
+  });
+
+  SALES_QUOTATION_LINE_UDF_MAPPINGS.forEach(({ sapField, sapFields, getValue }) => {
+    const aliases = sapFields || [sapField];
+    const resolvedSapField = resolveAvailableUdfKey(availableUdfKeys, aliases);
+    if (!resolvedSapField) return;
+    assignMappedUdfValue(udfs, resolvedSapField, getValue(line), normalizeUdfValue);
+  });
+
+  SALES_QUOTATION_LABEL_UDF_MAPPINGS.forEach(({ labels, getValue }) => {
+    const sapField = labels.map((label) => udfMetadata.labelToKey?.[compactLabel(label)]).find(Boolean);
+    if (!sapField || !availableUdfKeys.has(sapField) || Object.prototype.hasOwnProperty.call(udfs, sapField)) return;
+    assignMappedUdfValue(udfs, sapField, getValue(line), normalizeUdfValue);
+  });
+
+  return normalizeUdfValues(udfs, availableUdfKeys, udfMetadata.definitionsByKey);
+};
+
+const buildDocumentLines = async (lines = [], includeLineNum = false) => {
+  const [udfMetadata, fieldMetadata] = await Promise.all([
+    getSalesQuotationLineUdfMetadata(),
+    salesQuotationDb.getSalesQuotationLineFieldMetadata().catch((error) => {
+      console.warn('[Sales Quotation] Live QUT1 field metadata is unavailable; using SAP-standard line fields only.', error.message);
+      return {};
+    }),
+  ]);
+  const effectiveUdfMetadata = {
+    ...udfMetadata,
+    keys: intersectPhysicalUdfKeys(udfMetadata.keys, fieldMetadata),
+  };
+
+  return Promise.all(lines
+    .filter((line) => String(getLineValue(line, ['itemNo', 'ItemCode']) || '').trim())
+    .map(async (line) => {
+      const documentLine = await buildMetadataValidatedStandardLine({
+        line: {
+          ...line,
+          taxCode: line.taxCode || line.stcode,
+        },
+        fieldMetadata,
+        includeLineNum,
+        resolveUomEntry: salesOrderDb.resolveSalesOrderLineUomEntry,
+        resolveDefaultUomWhenMissing: true,
+        resolveHsnEntry: hsnCodeDbService.resolveHSNCodeToAbsEntry,
+        resolveSacEntry: hsnCodeDbService.resolveSACCodeToAbsEntry,
+      });
+      Object.assign(documentLine, buildValidatedLineUdfs(line, effectiveUdfMetadata));
+
+      if (Array.isArray(line.batches) && line.batches.length > 0) {
+        const batchNumbers = line.batches
+          .filter((batch) => String(batch.batchNumber || '').trim() && Number(batch.quantity) > 0)
+          .map((batch) => ({
+            BatchNumber: String(batch.batchNumber).trim(),
+            Quantity: Number(batch.quantity),
+          }));
+        if (batchNumbers.length) documentLine.BatchNumbers = batchNumbers;
+      }
+
+      return compactDocumentLinePayload(documentLine, { preserveNullUdfs: includeLineNum });
+    }));
+};
+
+// ───────── HELPERS ─────────
+
+const convertSalesEmployeeToCode = async (input, salesEmployees = []) => {
+  if (!input || input === '-1' || input === -1 || String(input).trim() === '') return null;
+  if (!isNaN(input) && Number(input) !== -1) return Number(input);
+
+  const name = String(input).trim();
+  const found = salesEmployees.find(emp =>
+    String(emp.SlpName || '').trim().toLowerCase() === name.toLowerCase()
+  );
+  if (found) return found.SlpCode;
+
+  const escapedName = name.replace(/'/g, "''");
+  try {
+    const searchResult = await sapService.request({
+      method: 'get',
+      url: `/SalesPersons?$filter=SalesEmployeeName eq '${escapedName}'&$select=SalesEmployeeCode,SalesEmployeeName`,
+    });
+    if (searchResult.data?.value?.length > 0) return searchResult.data.value[0].SalesEmployeeCode;
+
+    const createResult = await sapService.request({
+      method: 'post',
+      url: '/SalesPersons',
+      data: { SalesEmployeeName: name, Active: 'tYES' },
+    });
+    return createResult.data?.SalesEmployeeCode;
+  } catch (error) {
+    throw new Error(`Sales Employee '${name}' could not be resolved: ${error.message}`);
+  }
+};
+
+const convertOwnerToCode = async (input, owners = []) => {
+  if (!input || String(input).trim() === '') return null;
+  if (!isNaN(input)) return Number(input);
+
+  const name = String(input).trim();
+  const found = owners.find(owner => {
+    const fullName = String(owner.FullName || '').trim().toLowerCase();
+    return fullName === name.toLowerCase() ||
+      String(owner.firstName || '').trim().toLowerCase() === name.toLowerCase();
+  });
+  if (found) return found.empID;
+
+  try {
+    const escapedName = name.replace(/'/g, "''");
+    const searchResult = await sapService.request({
+      method: 'get',
+      url: `/EmployeesInfo?$filter=FirstName eq '${escapedName}'&$select=EmployeeID,FirstName,LastName`,
+    });
+    if (searchResult.data?.value?.length > 0) return searchResult.data.value[0].EmployeeID;
+  } catch (error) {
+    console.warn('⚠️ Owner lookup failed:', error.message);
+  }
+  return null;
+};
+
+// ───────── REFERENCE DATA ─────────
+
+const getReferenceData = async (companyId) => {
+  try {
+    const [data, currencyContext] = await Promise.all([
+      salesQuotationDb.getReferenceData(),
+      loadCompanyCurrencyContext(),
+    ]);
+    return mergeCurrencyReferenceData(data, currencyContext);
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load reference data:', error);
+    return {
+      company: '', customers: [], vendors: [], items: [],
+      warehouses: [], warehouse_addresses: [], payment_terms: [],
+      shipping_types: [], branches: [], tax_codes: [], uom_groups: [],
+      contacts: [], pay_to_addresses: [], company_address: {},
+      decimal_settings: { QtyDec: 2, PriceDec: 2, SumDec: 2, RateDec: 2, PercentDec: 2 },
+      warnings: [`Failed to load reference data: ${error.message}`],
+    };
+  }
+};
+
+// ───────── CUSTOMER DETAILS ─────────
+
+const getCustomerDetails = async (customerCode) => {
+  try {
+    return await salesQuotationDb.getCustomerDetails(customerCode);
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load customer details:', error);
+    throw error;
+  }
+};
+
+// ───────── LIST ─────────
+
+const getSalesQuotationList = async ({
+  query = '',
+  openOnly = false,
+  docNum = '',
+  customerCode = '',
+  customerName = '',
+  sellerCode = '',
+  sellerName = '',
+  status = '',
+  postingDateFrom = '',
+  postingDateTo = '',
+  page = 1,
+  pageSize = 25,
+} = {}) => {
+  try {
+    return await salesQuotationDb.getSalesQuotationList({
+      query,
+      openOnly,
+      docNum,
+      customerCode,
+      customerName,
+      sellerCode,
+      sellerName,
+      status,
+      postingDateFrom,
+      postingDateTo,
+      page,
+      pageSize,
+    });
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load list:', error);
+    return {
+      quotations: [],
+      pagination: {
+        page: Math.max(1, Number(page) || 1),
+        pageSize: Math.min(200, Math.max(1, Number(pageSize) || 25)),
+        totalCount: 0,
+        totalPages: 1,
+      },
+    };
+  }
+};
+
+const getCustomerFilterOptions = async ({
+  query = '',
+  customerCode = '',
+  customerName = '',
+  top,
+  display = 'code',
+} = {}) => {
+  try {
+    const rows = await salesQuotationDb.searchCustomers({
+      query,
+      cardCode: customerCode,
+      cardName: customerName,
+      top,
+      sortBy: display === 'name' ? 'name' : 'code',
+    });
+
+    return {
+      options: rows.map((row) => ({
+        code: display === 'name'
+          ? String(row.CardName || '').trim()
+          : String(row.CardCode || '').trim(),
+        name: display === 'name'
+          ? String(row.CardCode || '').trim()
+          : String(row.CardName || '').trim(),
+      })).filter((option) => option.code),
+    };
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load customer filter options:', error);
+    return { options: [] };
+  }
+};
+
+// ───────── GET SINGLE ─────────
+
+const getSalesQuotation = async (docEntry) => {
+  try {
+    const [result, currencyContext] = await Promise.all([
+      salesQuotationDb.getSalesQuotation(docEntry),
+      loadCompanyCurrencyContext(),
+    ]);
+    const referenceData = mergeCurrencyReferenceData({}, currencyContext);
+    if (result?.sales_quotation?.header?.exchangeRate) {
+      result.sales_quotation.header.exchangeRate = String(
+        fromStoredDocumentRate(result.sales_quotation.header.exchangeRate, referenceData),
+      );
+    }
+    return result;
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load quotation:', error);
+    throw error;
+  }
+};
+
+// ───────── CREATE (SERVICE LAYER) ─────────
+
+const submitSalesQuotation = async (payload) => {
+  try {
+    const refData = await getReferenceData();
+    const customerDetails = await getCustomerDetails(payload.header?.vendor).catch((error) => {
+      console.warn('[Sales Quotation Service] Continuing without BP address-code validation:', error.message);
+      return {};
+    });
+    payload = {
+      ...payload,
+      header: normalizeSubmittedAddressHeader(payload.header, customerDetails),
+    };
+    const salesEmployees = refData.sales_employees || [];
+    const owners = refData.owners || [];
+
+    let salesEmployeeInput = payload.header.salesEmployee;
+    if (!salesEmployeeInput || salesEmployeeInput === '-1' || salesEmployeeInput === -1) {
+      salesEmployeeInput = payload.header.purchaser;
+    }
+
+    const SlpCode = await convertSalesEmployeeToCode(salesEmployeeInput, salesEmployees);
+    const OwnerCode = await convertOwnerToCode(payload.header.owner, owners);
+    const Remarks = payload.header.otherInstruction || payload.header.remarks || '';
+    const Freight = payload.header.freight ? Number(payload.header.freight) : 0;
+    const DiscountPercent = getHeaderDiscountPercent(payload.header);
+    const documentAdditionalExpenses = buildDocumentAdditionalExpenses(payload.freightCharges);
+    const documentLines = await buildDocumentLines(payload.lines);
+    const branchId = resolveSubmittedBranchId(payload.header, payload.lines, refData);
+    validateSubmittedBranch(branchId, refData);
+
+    const sapPayload = {
+      CardCode: payload.header.vendor.trim(),
+      ...buildDocumentSeriesPayload(payload.header),
+      DocDate: payload.header.postingDate,
+      DocDueDate: payload.header.deliveryDate,
+      TaxDate: payload.header.documentDate,
+      ContactPersonCode: payload.header.contactPerson ? Number(payload.header.contactPerson) : undefined,
+      BPLId: branchId,
+      BPL_IDAssignedToInvoice: branchId,
+      PaymentGroupCode: payload.header.paymentTerms ? Number(payload.header.paymentTerms) : undefined,
+      ...(DiscountPercent !== undefined ? { DiscountPercent } : {}),
+      ...(SlpCode !== null && SlpCode !== undefined ? { SalesPersonCode: SlpCode } : {}),
+      ...(OwnerCode !== null && OwnerCode !== undefined ? { DocumentsOwner: OwnerCode } : {}),
+      ...(Remarks ? { Comments: Remarks } : {}),
+      ...(Freight > 0 ? { TotalExpenses: Freight } : {}),
+      ...buildDocumentRoundingPayload(payload.header),
+      ...buildDocumentConfirmationPayload(payload.header),
+      DocumentAdditionalExpenses: documentAdditionalExpenses,
+      ...buildMarketingDocumentAddressPayload(payload.header),
+      NumAtCard: payload.header.customerRefNo ?? payload.header.salesContractNo ?? undefined,
+      DocumentLines: documentLines,
+      ...buildDocumentLogisticsPayload(payload.header),
+    };
+    applySapDocumentCurrency(sapPayload, payload.header, refData);
+
+    await applySalesQuotationHeaderUdfs(sapPayload, payload);
+
+    console.log('🔥 SAP Quotation Payload:', JSON.stringify(sapPayload, null, 2));
+
+    const response = await sapService.request({
+      method: 'post',
+      url: '/Quotations',
+      data: sapPayload,
+    });
+
+    return {
+      message: 'Sales quotation created successfully',
+      doc_num: response.data?.DocNum,
+      doc_entry: response.data?.DocEntry,
+      DocNum: response.data?.DocNum,
+      DocEntry: response.data?.DocEntry,
+    };
+  } catch (error) {
+    // Log comprehensive error information for debugging
+    console.error('SAP Quotation Error:', JSON.stringify({
+      message: error.message,
+      sapErrorData: error.response?.data,
+      statusCode: error.response?.status,
+      errorStack: error.stack,
+    }, null, 2));
+
+    // Extract meaningful error message
+    let errorMessage = 'Sales quotation submission failed.';
+    if (error.response?.data?.error?.message?.value) {
+      errorMessage = error.response.data.error.message.value;
+    } else if (error.response?.data?.error?.message) {
+      errorMessage = error.response.data.error.message;
+    } else if (error.message) {
+      errorMessage = error.message;
+    }
+
+    // Create enriched error for client
+    const sapError = new Error(errorMessage);
+    sapError.response = error.response;
+    sapError.statusCode = error.response?.status || 500;
+    throw sapError;
+  }
+};
+
+// ───────── UPDATE (SERVICE LAYER) ─────────
+
+const updateSalesQuotation = async (docEntry, payload) => {
+  const confirmationResult = await updateDocumentConfirmationOnly(docEntry, payload, 'Quotations', sapService);
+  if (confirmationResult) return confirmationResult;
+  try {
+    const refData = await getReferenceData();
+    const customerDetails = await getCustomerDetails(payload.header?.vendor).catch((error) => {
+      console.warn('[Sales Quotation Service] Continuing without BP address-code validation:', error.message);
+      return {};
+    });
+    payload = {
+      ...payload,
+      header: normalizeSubmittedAddressHeader(payload.header, customerDetails),
+    };
+    const salesEmployees = refData.sales_employees || [];
+    const owners = refData.owners || [];
+
+    let salesInput = payload.header.salesEmployee;
+    if (!salesInput || salesInput === '-1' || salesInput === -1) {
+      salesInput = payload.header.purchaser;
+    }
+
+    const SlpCode = await convertSalesEmployeeToCode(salesInput, salesEmployees);
+    const OwnerCode = await convertOwnerToCode(payload.header.owner, owners);
+    const Remarks = payload.header.otherInstruction || payload.header.remarks || '';
+    const Freight = Number(payload.header.freight) || 0;
+    const DiscountPercent = getHeaderDiscountPercent(payload.header);
+    const documentAdditionalExpenses = buildDocumentAdditionalExpenses(payload.freightCharges);
+    const documentLines = await buildDocumentLines(payload.lines, true);
+    const branchId = resolveSubmittedBranchId(payload.header, payload.lines, refData);
+
+    const sapPayload = {
+      CardCode: payload.header.vendor?.trim(),
+      DocDate: payload.header.postingDate,
+      DocDueDate: payload.header.deliveryDate,
+      TaxDate: payload.header.documentDate,
+      ContactPersonCode: payload.header.contactPerson ? Number(payload.header.contactPerson) : undefined,
+      BPL_IDAssignedToInvoice: branchId,
+      PaymentGroupCode: payload.header.paymentTerms ? Number(payload.header.paymentTerms) : undefined,
+      ...(DiscountPercent !== undefined ? { DiscountPercent } : {}),
+      ...(SlpCode !== null && SlpCode !== undefined && { SalesPersonCode: SlpCode }),
+      ...(OwnerCode !== null && OwnerCode !== undefined && { DocumentsOwner: OwnerCode }),
+      ...(Remarks && { Comments: Remarks }),
+      ...(Freight > 0 && { TotalExpenses: Freight }),
+      ...buildDocumentRoundingPayload(payload.header),
+      ...buildDocumentConfirmationPayload(payload.header),
+      DocumentAdditionalExpenses: documentAdditionalExpenses,
+      ...buildMarketingDocumentAddressPayload(payload.header),
+      NumAtCard: payload.header.customerRefNo ?? payload.header.salesContractNo ?? undefined,
+      DocumentLines: documentLines,
+      ...buildDocumentLogisticsPayload(payload.header),
+    };
+    applySapDocumentCurrency(sapPayload, payload.header, refData);
+
+    await applySalesQuotationHeaderUdfs(sapPayload, payload);
+
+    await sapService.request({
+      method: 'patch',
+      url: `/Quotations(${docEntry})`,
+      data: sapPayload,
+    });
+
+    return { message: 'Sales quotation updated successfully', doc_entry: docEntry };
+  } catch (error) {
+    console.error('SAP Quotation Update Error:', JSON.stringify({
+      message: error.message,
+      sapErrorData: error.response?.data,
+      statusCode: error.response?.status,
+      errorStack: error.stack,
+    }, null, 2));
+
+    // Extract meaningful error message
+    let errorMessage = 'Sales quotation update failed.';
+    if (error.response?.data?.error?.message?.value) {
+      errorMessage = error.response.data.error.message.value;
+    } else if (error.response?.data?.error?.message) {
+      errorMessage = error.response.data.error.message;
+    } else if (error.message) {
+      errorMessage = error.message;
+    }
+
+    // Create enriched error for client
+    const sapError = new Error(errorMessage);
+    sapError.response = error.response;
+    sapError.statusCode = error.response?.status || 500;
+    throw sapError;
+  }
+};
+
+// ───────── DOCUMENT SERIES ─────────
+
+const getDocumentSeries = async (targetDate = null, { branch = '' } = {}) => {
+  try {
+    const series = await salesQuotationDb.getDocumentSeries(targetDate, { branch });
+    return { series };
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to load document series:', error);
+    throw error;
+  }
+};
+
+const getNextNumber = async (seriesParam) => {
+  try {
+    const series = Number(seriesParam);
+    if (isNaN(series)) throw new Error('Invalid series number');
+    return await salesQuotationDb.getNextNumber(series);
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get next number:', error);
+    throw error;
+  }
+};
+
+const getStateFromAddress = async (cardCode, addressCode) => {
+  try {
+    return await salesQuotationDb.getStateFromAddress(cardCode, addressCode);
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get state from address:', error);
+    return { state: '' };
+  }
+};
+
+const getItemsForModal = async () => {
+  try {
+    const items = await salesQuotationDb.getItemsForModal();
+    return { items };
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get items for modal:', error);
+    return { items: [] };
+  }
+};
+
+const getFreightCharges = async (docEntry) => {
+  try {
+    const freightCharges = await salesQuotationDb.getFreightCharges(docEntry);
+    return { freightCharges };
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get freight charges:', error);
+    return { freightCharges: [] };
+  }
+};
+
+// ───────── OPEN QUOTATIONS FOR COPY ─────────
+
+const createLookupValue = async ({ field, value, description }) => {
+  const fieldMap = {
+    buyerQuality: 'U_Buyer_Quality',
+    sellerQuality: 'U_Seller_Quality',
+    buyerPrice: 'U_Buyer_Price',
+    sellerPrice: 'U_Seller_Price',
+  };
+
+  const aliasId = fieldMap[String(field || '').trim()] || String(field || '').trim();
+  if (!aliasId) {
+    throw new Error('Lookup field is required.');
+  }
+
+  const option = await salesQuotationDb.createLookupValue(aliasId, value, description);
+  const options = await salesQuotationDb.getLookupValues(aliasId);
+
+  return { option, options };
+};
+
+const getOpenSalesQuotations = async (customerCode = '') => {
+  try {
+    const documents = await salesQuotationDb.getOpenSalesQuotations(customerCode);
+    return { documents };
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get open quotations:', error);
+    return { documents: [] };
+  }
+};
+
+const getSalesQuotationForCopy = async (docEntry) => {
+  try {
+    const quotation = await salesQuotationDb.getSalesQuotationForCopy(docEntry);
+    return normalizeCopyDocumentRateForCompany(quotation);
+  } catch (error) {
+    console.error('[Sales Quotation Service] Failed to get quotation for copy:', error);
+    throw error;
+  }
+};
+
+module.exports = {
+  getReferenceData,
+  getCustomerDetails,
+  getCustomerFilterOptions,
+  getSalesQuotationList,
+  getSalesQuotation,
+  submitSalesQuotation,
+  updateSalesQuotation,
+  getDocumentSeries,
+  getNextNumber,
+  getStateFromAddress,
+  getItemsForModal,
+  getFreightCharges,
+  createLookupValue,
+  getOpenSalesQuotations,
+  getSalesQuotationForCopy,
+};

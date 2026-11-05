@@ -1,0 +1,75 @@
+import { buildDuplicateHeader, buildDuplicateLines } from './documentDuplicate';
+
+describe('document duplication', () => {
+  test('keeps the selected series while clearing document identity', () => {
+    expect(buildDuplicateHeader(
+      { docNo: '1363', series: '293', seriesName: 'JD2627', status: 'Open' },
+      { docNo: '', series: '', status: 'Open', nextNumber: '' },
+    )).toMatchObject({
+      docNo: '',
+      nextNumber: '',
+      series: '293',
+      seriesName: 'JD2627',
+      status: 'Open',
+    });
+  });
+  test('clears hidden manual document number aliases', () => {
+    expect(buildDuplicateHeader(
+      {
+        docNo: '120',
+        nextNumber: '120',
+        manualDocumentNumber: '120',
+        manualDocNum: '120',
+        orderNumber: '120',
+        series: '-1',
+        status: 'Open',
+      },
+      { docNo: '', series: '', status: 'Open', nextNumber: '' },
+    )).toMatchObject({
+      docNo: '',
+      nextNumber: '',
+      manualDocumentNumber: '',
+      manualDocNum: '',
+      orderNumber: '',
+      series: '-1',
+      status: 'Open',
+    });
+  });
+
+  test('removes GRPO base references from duplicated invoice rows', () => {
+    const createLine = () => ({ itemNo: '', quantity: '', baseType: null, baseEntry: null, baseLine: null });
+    const duplicated = buildDuplicateLines([{
+      itemNo: 'ITEM-1',
+      quantity: '4',
+      baseType: 20,
+      baseEntry: 6,
+      baseLine: 0,
+    }], createLine, []);
+
+    expect(duplicated[0]).toMatchObject({
+      itemNo: 'ITEM-1',
+      quantity: '4',
+      baseType: null,
+      baseEntry: null,
+      baseLine: null,
+    });
+  });
+
+  test('preserves a manual UoM as an editable measure-unit name, not SAP entry -1', () => {
+    const duplicated = buildDuplicateLines([{
+      itemNo: 'ITEM-1',
+      quantity: '4',
+      uomEntry: -1,
+      uomCode: 'KGS',
+      uomName: 'KGS',
+    }], () => ({ itemNo: '', quantity: '', uomEntry: null, uomCode: '', uomName: '' }), []);
+
+    expect(duplicated[0]).toMatchObject({
+      itemNo: 'ITEM-1',
+      uomEntry: null,
+      uomCode: 'KGS',
+      uomName: 'KGS',
+      uomNameEdited: true,
+    });
+  });
+});

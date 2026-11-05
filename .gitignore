@@ -1,0 +1,56 @@
+# Local secrets: only sanitized examples may be committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+.npmrc
+.netrc
+credentials*
+secrets*
+
+# Dependencies and generated output
+node_modules/
+build/
+build-*/
+dist/
+coverage/
+.cache/
+frontend/public/pdfjs-assets/
+
+# Private runtime/business data
+backend/data/
+backend/uploads/
+backend/report-overrides/
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+*.bak
+*.backup
+*.rpt
+*.pdf
+*.xls
+*.xlsx
+*.csv
+*.zip
+*.7z
+*.tar
+*.gz
+logs/
+*.log
+
+# Deployment-only artifacts
+deployment/
+backend/logistics-review/
+frontend/src/logistics-review/
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

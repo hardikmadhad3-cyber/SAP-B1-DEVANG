@@ -1,0 +1,36 @@
+.company-reports-page { background: #eef3f8; color: #1f2f46; }
+.company-reports-page__title { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: #f7fbff; border-bottom: 1px solid #b6c3d4; }
+.company-reports-page__title h1 { margin: 0; font-size: 20px; }
+.company-reports-page__title p { margin: 4px 0 0; color: #5d6f89; font-size: 13px; }
+.company-reports-page__body { padding: 18px; min-height: 0; }
+.company-reports-page__card { max-width: 1400px; margin: 0 auto; background: #fff; border: 1px solid #b6c3d4; }
+.company-reports-page__search { display: flex; align-items: center; gap: 8px; width: min(470px, 65%); }
+.company-reports-page__card .rs-card__header input { flex: 1; min-width: 140px; height: 36px; padding: 0 10px; border: 1px solid #a9bad0; border-radius: 4px; }
+.company-reports-page__browser { display: grid; grid-template-columns: 230px minmax(0, 1fr); }
+.company-reports-page__categories { padding: 12px 8px; border-right: 1px solid #d8e2ef; background: #f5f8fc; max-height: calc(100vh - 290px); overflow: auto; }
+.company-reports-page__category { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 11px 12px; margin-bottom: 4px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #294763; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.company-reports-page__category[aria-pressed="true"] { background: #e2effd; color: #094b83; border-color: #a9c9e9; font-weight: 700; }
+.company-reports-page__category:hover { background: #eaf1fa; }
+.company-reports-page__category small { white-space: nowrap; color: #536882; font-variant-numeric: tabular-nums; }
+.company-reports-page__category:focus-visible, .company-reports-page__row:focus-visible { outline: 2px solid #2876ba; outline-offset: -2px; }
+.company-reports-page__results { min-width: 0; }
+.company-reports-page__summary { display: flex; justify-content: space-between; gap: 10px; padding: 12px 15px; border-bottom: 1px solid #d8e2ef; font-size: 13px; }
+.company-reports-page__summary span { color: #5d6f89; }
+.company-reports-page__list { max-height: calc(100vh - 333px); min-height: 150px; overflow: auto; }
+.company-reports-page__group-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 15px; background: #edf3fa; border-bottom: 1px solid #d8e2ef; }
+.company-reports-page__group-heading h4 { margin: 0; color: #164d7a; font-size: 14px; }
+.company-reports-page__group-heading p { margin: 3px 0 0; font-size: 12px; color: #5d6f89; }
+.company-reports-page__count { padding: 2px 8px; border: 1px solid #c3d4e5; border-radius: 10px; background: #fff; color: #365875; font-size: 12px; }
+.company-reports-page__row { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 15px; padding: 11px 15px; border: 0; border-bottom: 1px solid #e5ebf2; background: #fff; color: #1f2f46; text-align: left; cursor: pointer; }
+.company-reports-page__row:hover, .company-reports-page__row:focus-visible { background: #eaf3ff; }
+.company-reports-page__row small { color: #5d6f89; white-space: nowrap; }
+.company-reports-page__row > span { overflow-wrap: anywhere; }
+.company-reports-page__row:disabled { cursor: wait; opacity: 0.65; }
+.company-reports-page__empty { padding: 24px 15px; color: #5d6f89; }
+@media (max-width: 800px) {
+  .company-reports-page__browser { grid-template-columns: 1fr; }
+  .company-reports-page__categories { display: flex; gap: 6px; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid #d8e2ef; }
+  .company-reports-page__category { width: auto; flex: 0 0 auto; margin: 0; }
+  .company-reports-page__list { max-height: 55vh; }
+}
+@media (max-width: 640px) { .company-reports-page__body { padding: 10px; } .company-reports-page__card .rs-card__header { align-items: stretch; flex-direction: column; } .company-reports-page__search { width: 100%; flex-wrap: wrap; } .company-reports-page__row { align-items: flex-start; } }
